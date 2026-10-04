@@ -10,6 +10,7 @@ bodies run on per-handle workers), not per-turn threads.
 import logging
 import os
 import threading
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -24,6 +25,12 @@ _REASON_LEASE_LOST = "session turn lease lost"
 
 LEASE_TTL_SECONDS = 300.0
 LEASE_WAIT_SECONDS = 1800.0
+# A refresh that RAISES (SQLite write-lock convoy, transient IO) is not lease loss: the row still
+# names this holder with most of its TTL unexpired (interval 60s vs TTL 300s). Retrying keeps the
+# row valid; the budget bounds the grace so the stop lands well inside the TTL (first failure at
+# ~TTL-interval, stop at ~TTL-60s) — a contender could never have reclaimed the expired row while
+# this holder still trusted it. See the 2026-10-04 exit-130 wave (#112647).
+LEASE_REFRESH_RETRY_BUDGET_S = 180.0
 
 
 class DurableTurnLease:
@@ -41,6 +48,10 @@ class DurableTurnLease:
         self.holder = holder
         self.stop = threading.Event()
         self.refresh_interval = float(getattr(agent, "_session_turn_lease_refresh_interval", 60.0))
+        self.refresh_retry_budget = float(
+            getattr(agent, "_session_turn_lease_refresh_retry_budget", LEASE_REFRESH_RETRY_BUDGET_S)
+        )
+        self._refresh_failure_started: Optional[float] = None
         self._lock = threading.Lock()
         self.turn_active = False
         self.interrupt_message: Optional[str] = None
@@ -187,13 +198,27 @@ class DurableTurnLease:
 
         The holder-qualified UPDATE fences a late refresher from a successor lease. The façade's
         finally sets ``stop`` before releasing, so a holder-fenced miss observed after stop is not
-        a loss."""
+        a loss.
+
+        A refresh that RAISES is not a miss: the UPDATE never ran, so the row still names this
+        holder with most of its TTL unexpired (interval 60s vs TTL 300s). The observed failure
+        mode is a SQLite write-lock convoy on state.db — many live Hermes workers whose short
+        BEGIN IMMEDIATE transactions starve the refresher's own BEGIN past its 20s write
+        patience, so ``refresh_session_turn_lease`` raises ``database is locked`` while the lease
+        row is untouched and perfectly valid. Failing the whole turn there killed every worker
+        simultaneously (2026-10-04 exit-130 wave) — exactly when the database was busiest, i.e.
+        when the most work would be lost. Instead the failure is retried at the refresh interval
+        until ``refresh_retry_budget`` elapses (bounded below the TTL, so a contender could never
+        have reclaimed the expired row while this holder still trusted it); past the budget, or
+        once the lease's remaining TTL can no longer cover the next tick, the turn is stopped
+        fail-closed as before."""
         if self.stop.is_set():
             return False
         try:
             if self.db.refresh_session_turn_lease(
                 self._current_session_id(), self.holder, ttl_seconds=LEASE_TTL_SECONDS
             ):
+                self._refresh_failure_started = None
                 return None
             if self.stop.is_set():
                 return False
@@ -204,12 +229,27 @@ class DurableTurnLease:
         except Exception:
             if self.stop.is_set():
                 return False
+            now = time.monotonic()
+            started = self._refresh_failure_started
+            self._refresh_failure_started = started or now
+            elapsed = now - self._refresh_failure_started
+            if elapsed >= self.refresh_retry_budget:
+                logger.error(
+                    "Session turn lease refresh kept failing for %.0fs (budget %.0fs); "
+                    "stopping to protect the transcript: %s",
+                    elapsed, self.refresh_retry_budget, self._current_session_id(),
+                    exc_info=True,
+                )
+                self._interrupt_turn(
+                    "Session turn lease could not be refreshed; stopping to protect the transcript."
+                )
+                return False
             logger.warning(
-                "Failed to refresh session turn lease: %s", self._current_session_id(), exc_info=True,
+                "Session turn lease refresh failed (attempt within %.0fs retry budget); "
+                "retrying next tick: %s",
+                self.refresh_retry_budget - elapsed, self._current_session_id(), exc_info=True,
             )
-            self._interrupt_turn(
-                "Session turn lease could not be refreshed; stopping to protect the transcript."
-            )
+            return None  # keep the timer alive: the lease row is still ours and unexpired
         return False
 
 

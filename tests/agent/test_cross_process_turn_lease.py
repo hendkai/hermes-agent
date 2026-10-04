@@ -537,10 +537,64 @@ def test_run_conversation_interrupts_when_lease_refresh_lost(monkeypatch):
     assert interrupt_calls[0][1] is True
 
 
-def test_run_conversation_interrupts_when_lease_refresh_errors(monkeypatch):
+def test_run_conversation_survives_transient_lease_refresh_error(monkeypatch):
+    """A refresh that raises 'database is locked' is a failed attempt, not lease loss: the row
+    still names this holder with most of its TTL unexpired. The turn must keep running and the
+    refresher must stay armed (2026-10-04 exit-130 wave)."""
     db = _DB()
     agent = _agent_with_db(db)
     agent._session_turn_lease_refresh_interval = 0.01
+    agent._session_turn_lease_refresh_retry_budget = 1.0
+    interrupt_calls = []
+
+    def track_interrupt(message=None, hard_cancel=False, **kwargs):
+        interrupt_calls.append((message, hard_cancel))
+        agent._interrupt_requested = True
+        agent._interrupt_message = message
+
+    agent.interrupt = track_interrupt
+
+    calls = {"n": 0}
+
+    def refresh_locked(session_id, holder, **kwargs):
+        calls["n"] += 1
+        if calls["n"] <= 4:
+            raise sqlite3.OperationalError("database is locked")
+        return True  # convoy clears: the next renewal succeeds
+
+    db.refresh_session_turn_lease = refresh_locked
+
+    observed = {"started": False}
+
+    def fake_run(_agent, _message, _system, history, *_args, **_kwargs):
+        observed["started"] = True
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if getattr(_agent, "_interrupt_requested", False):
+                raise AssertionError("transient refresh error interrupted a live turn")
+            time.sleep(0.01)
+        return {"final_response": "ok", "messages": history, "failed": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_run)
+
+    result = AIAgent.run_conversation(
+        agent,
+        "new message",
+        conversation_history=[{"role": "user", "content": "seed"}],
+    )
+
+    assert observed["started"] is True
+    assert result["final_response"] == "ok"
+    assert interrupt_calls == []
+    assert calls["n"] >= 5  # refresher stayed armed after the failures
+
+
+def test_run_conversation_interrupts_when_lease_refresh_errors_past_budget(monkeypatch):
+    """Persistent refresh errors exhaust the retry budget and stop the turn fail-closed."""
+    db = _DB()
+    agent = _agent_with_db(db)
+    agent._session_turn_lease_refresh_interval = 0.01
+    agent._session_turn_lease_refresh_retry_budget = 0.5
     interrupt_calls = []
 
     def track_interrupt(message=None, hard_cancel=False, **kwargs):
@@ -556,7 +610,7 @@ def test_run_conversation_interrupts_when_lease_refresh_errors(monkeypatch):
     db.refresh_session_turn_lease = refresh_error
 
     def fake_run(_agent, _message, _system, history, *_args, **_kwargs):
-        deadline = time.monotonic() + 2.0
+        deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline:
             if getattr(_agent, "_interrupt_requested", False):
                 return {
@@ -567,7 +621,7 @@ def test_run_conversation_interrupts_when_lease_refresh_errors(monkeypatch):
                     "interrupted": True,
                 }
             time.sleep(0.01)
-        raise AssertionError("refresh error did not interrupt the turn")
+        raise AssertionError("persistent refresh error did not interrupt the turn")
 
     monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_run)
 
@@ -586,6 +640,7 @@ def test_refresh_error_after_loop_completion_does_not_poison_next_turn(monkeypat
     db = _DB()
     agent = _agent_with_db(db)
     agent._session_turn_lease_refresh_interval = 0.01
+    agent._session_turn_lease_refresh_retry_budget = 0.0  # fail at once, like the old behavior
     refresh_started = threading.Event()
     release_refresh = threading.Event()
     interrupt_started = threading.Event()
